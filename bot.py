@@ -40,15 +40,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+# Токен НЕ хранится в коде (репозиторий публичный): он берётся из переменных
+# окружения хостинга. Поддержаны популярные названия переменной.
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TOKEN")
+    or ""
+).strip()
+if not BOT_TOKEN:
+    raise SystemExit(
+        "Не задан токен бота. Добавьте переменную BOT_TOKEN в настройках хостинга."
+    )
 
-_channel = os.environ["CHANNEL_ID"].strip()  # @my_channel или -1001234567890
+# Канал для публикаций (можно переопределить переменной CHANNEL_ID)
+_channel = os.getenv("CHANNEL_ID", "@trade_bish").strip()
 CHANNEL_ID = int(_channel) if _channel.lstrip("-").isdigit() else _channel
 
-# Telegram ID модераторов через запятую
-ADMIN_IDS = {int(x) for x in os.environ["ADMIN_IDS"].split(",") if x.strip()}
+# Telegram ID модераторов через запятую (можно переопределить переменной ADMIN_IDS)
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "6408237678").split(",") if x.strip()
+}
 
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+# В облаке Amvera постоянное хранилище смонтировано в /data — кладём базу туда
+DB_PATH = os.getenv("DB_PATH", "/data/bot.db" if os.path.isdir("/data") else "bot.db")
 MAX_PHOTOS = 10
 CAPTION_LIMIT = 1024  # лимит Telegram на подпись к фото
 
