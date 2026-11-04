@@ -55,7 +55,7 @@ if not BOT_TOKEN:
     )
 
 # Канал для публикаций (можно переопределить переменной CHANNEL_ID)
-_channel = os.getenv("CHANNEL_ID", "@trade_bish").strip()
+_channel = os.getenv("CHANNEL_ID", "@Sz_tradetech").strip()
 CHANNEL_ID = int(_channel) if _channel.lstrip("-").isdigit() else _channel
 
 # Telegram ID модераторов через запятую (можно переопределить переменной ADMIN_IDS)
@@ -131,6 +131,48 @@ FIELDS = [
     ),
 ]
 FIELD_STATES = [f[1] for f in FIELDS]
+
+
+def category_field_prompt(key: str, category: str) -> str:
+    """Возвращает пример, соответствующий выбранной категории."""
+    examples = {
+        "smartphones": {
+            "title": "📱 Какой смартфон продаёте? Укажите бренд, модель и версию.\n\nНапример: <i>Vivo X200s 12/512 ГБ, нежно-зелёный</i>",
+            "specs": "⚙️ Характеристики смартфона — одним сообщением. Например:\n\n<i>Память: 512 ГБ\nОЗУ: 12 ГБ\nЭкран: AMOLED, 120 Гц\nПроцессор: Dimensity 9400+\nСостояние: отличное\nКомплект: коробка, кабель</i>",
+        },
+        "tablets": {
+            "title": "📲 Какой планшет продаёте? Укажите бренд, модель и память.\n\nНапример: <i>iPad Air 11 128 ГБ Wi‑Fi, серый</i>",
+            "specs": "⚙️ Характеристики планшета. Например:\n\n<i>Диагональ: 11 дюймов\nПамять: 128 ГБ\nПодключение: Wi‑Fi\nЭкран: Liquid Retina\nКомплект: планшет, зарядка, чехол</i>",
+        },
+        "laptops": {
+            "title": "💻 Что продаёте? Укажите бренд и точную модель ноутбука или комплектующих.\n\nНапример: <i>Lenovo IdeaPad 5 15ITL05</i>",
+            "specs": "⚙️ Характеристики ноутбука/ПК. Например:\n\n<i>Процессор: Intel Core i5-1135G7\nОЗУ: 16 ГБ DDR4\nНакопитель: SSD 512 ГБ\nВидеокарта: Intel Iris Xe\nЭкран: 15,6 дюйма, Full HD\nОС: Windows 11</i>",
+        },
+        "wearables": {
+            "title": "⌚ Какие смарт-часы или браслет продаёте?\n\nНапример: <i>Huawei Watch GT 5 46 мм, чёрные</i>",
+            "specs": "⚙️ Характеристики часов. Например:\n\n<i>Размер корпуса: 46 мм\nМатериал: нержавеющая сталь\nЭкран: AMOLED\nСовместимость: Android/iOS\nАвтономность: до 10 дней\nКомплект: часы, ремешок, зарядка</i>",
+        },
+        "audio": {
+            "title": "🎧 Какие наушники или аудиоустройство продаёте?\n\nНапример: <i>Sony WH-1000XM5, чёрные</i>",
+            "specs": "⚙️ Характеристики аудиоустройства. Например:\n\n<i>Тип: полноразмерные, беспроводные\nПодключение: Bluetooth 5.2\nШумоподавление: есть\nАвтономность: до 30 часов\nКомплект: наушники, кейс/кабель</i>",
+        },
+        "gaming": {
+            "title": "🎮 Что из игровой техники продаёте?\n\nНапример: <i>Sony PlayStation 5 Slim 1 ТБ</i>",
+            "specs": "⚙️ Характеристики игровой техники. Например:\n\n<i>Модель: PlayStation 5 Slim\nПамять: 1 ТБ SSD\nРевизия: указать при наличии\nГеймпады: 1 DualSense\nКомплект: консоль, кабели, коробка</i>",
+        },
+        "accessories": {
+            "title": "🔌 Какой аксессуар продаёте? Укажите бренд и модель.\n\nНапример: <i>Anker Nano MagGo 10000 мА·ч</i>",
+            "specs": "⚙️ Характеристики аксессуара. Например:\n\n<i>Тип: внешний аккумулятор\nЁмкость: 10 000 мА·ч\nМощность: до 30 Вт\nРазъёмы: USB‑C\nСовместимость: указать устройства\nКомплект: устройство, кабель</i>",
+        },
+        "other": {
+            "title": "📦 Что именно продаёте? Укажите название и модель, если есть.\n\nНапример: <i>Умная колонка Яндекс Станция Мини 2</i>",
+        },
+    }
+    fallback = {
+        "title": "📦 Что именно продаёте? Укажите название и модель, если есть.",
+        "specs": "⚙️ Укажите основные характеристики товара: модель, состояние, комплектацию и важные параметры.",
+    }
+    return examples.get(category, {}).get(key, fallback.get(key, ""))
 
 CATEGORIES = {
     "smartphones": "📱 Смартфоны",
@@ -619,7 +661,7 @@ async def choose_ad_category(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(category=category)
     await state.set_state(FIELDS[0][1])
     await cb.message.edit_text(f"Категория: <b>{e(CATEGORIES[category])}</b>")
-    await cb.message.answer(FIELDS[0][2] + "\n\n<i>/cancel — отмена</i>")
+    await cb.message.answer(category_field_prompt("title", category) + "\n\n<i>/cancel — отмена</i>")
     await cb.answer("Категория выбрана")
 
 
@@ -671,9 +713,12 @@ async def collect_field(message: Message, state: FSMContext) -> None:
     await state.update_data(**{key: value})
 
     if idx + 1 < len(FIELDS):
-        _, next_state, prompt, _ = FIELDS[idx + 1]
+        next_key, next_state, prompt, _ = FIELDS[idx + 1]
+        data = await state.get_data()
+        category = data.get("category", "other")
+        category_prompt = category_field_prompt(next_key, category)
         await state.set_state(next_state)
-        await message.answer(prompt)
+        await message.answer(category_prompt or prompt)
     else:
         await state.set_state(Form.photos)
         await state.update_data(photos=[])
@@ -810,9 +855,22 @@ async def mod_approve(cb: CallbackQuery, bot: Bot) -> None:
                 await db.execute("UPDATE ads SET channel_message_id=? WHERE id=?", (sent.message_id, ad_id))
                 await db.commit()
     except TelegramAPIError as exc:
-        await set_status(ad_id, "pending")  # откатываем
-        log.exception("Не удалось опубликовать заявку #%s", ad_id)
-        await cb.answer(f"Ошибка публикации: {exc}"[:190], show_alert=True)
+        await set_status(ad_id, "pending")  # заявка остаётся доступной для повторной публикации
+        log.exception("Не удалось опубликовать заявку #%s в канал %s", ad_id, CHANNEL_ID)
+        error_text = str(exc)
+        if "chat not found" in error_text.lower():
+            user_error = (
+                "Не удалось найти канал @Sz_tradetech. Проверьте username канала, "
+                "добавление бота в канал и права администратора."
+            )
+        elif "not enough rights" in error_text.lower() or "forbidden" in error_text.lower():
+            user_error = (
+                "У бота нет прав на публикацию в канале @Sz_tradetech. "
+                "Назначьте его администратором и разрешите публикацию сообщений."
+            )
+        else:
+            user_error = f"Ошибка Telegram при публикации: {error_text}"
+        await cb.answer(user_error[:190], show_alert=True)
         return
 
     await cb.message.edit_text(
@@ -883,11 +941,41 @@ async def mod_reject_finish(message: Message, state: FSMContext, bot: Bot) -> No
 # ──────────────────────────── Запуск ────────────────────────────
 
 
+async def check_publication_channel(bot: Bot) -> None:
+    """Проверяет доступность канала и права бота до начала работы."""
+    try:
+        chat = await bot.get_chat(CHANNEL_ID)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        status = getattr(member, "status", "unknown")
+        if status != "administrator" and str(status) != "ChatMemberStatus.ADMINISTRATOR":
+            log.error(
+                "Бот найден в канале %s, но не является администратором (status=%s). "
+                "Назначьте бота администратором с правом публикации.",
+                getattr(chat, "username", None) or chat.id, status,
+            )
+            return
+        if getattr(member, "can_post_messages", True) is False:
+            log.error("У бота отключено право публикации сообщений в канале %s", chat.id)
+            return
+        log.info(
+            "Канал публикаций доступен: %s (chat_id=%s); бот имеет права администратора.",
+            f"@{chat.username}" if chat.username else chat.title, chat.id,
+        )
+    except TelegramAPIError as exc:
+        log.error(
+            "Не удалось проверить канал публикаций %s: %s. Проверьте CHANNEL_ID, "
+            "добавление бота в канал и права администратора.", CHANNEL_ID, exc,
+        )
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await init_db()
 
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await check_publication_channel(bot)
+
     dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
 
