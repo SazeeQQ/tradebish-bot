@@ -55,10 +55,10 @@ if not BOT_TOKEN:
     )
 
 # Канал для публикаций (можно переопределить переменной CHANNEL_ID)
-_channel = os.getenv("CHANNEL_ID", "@Sz_tradetech").strip()
+_channel = os.getenv("CHANNEL_ID", "@trade_bish").strip()
 CHANNEL_ID = int(_channel) if _channel.lstrip("-").isdigit() else _channel
 # Публичная ссылка для пользователей. Для Telegram API CHANNEL_ID по-прежнему нужен как @username или числовой ID.
-CHANNEL_URL = "https://t.me/Sz_tradetech"
+CHANNEL_URL = "https://t.me/trade_bish"
 
 # Telegram ID модераторов через запятую (можно переопределить переменной ADMIN_IDS)
 ADMIN_IDS = {
