@@ -69,6 +69,7 @@ CAPTION_LIMIT = 1024  # лимит Telegram на подпись к фото
 
 log = logging.getLogger("ads_bot")
 router = Router()
+BOT_USERNAME: str | None = None
 e = html.escape  # экранирование пользовательского текста для HTML
 
 # ──────────────────────────── Анкета ────────────────────────────
@@ -95,7 +96,7 @@ FIELDS = [
         "title",
         Form.title,
         "📱 Что продаёте? Напишите название и модель.\n\n"
-        "Например: <i>iPhone 13 128 ГБ, чёрный</i>",
+        "Например: <i>iPhone 13, чёрный</i>",
         100,
     ),
     (
@@ -151,6 +152,7 @@ STATUS_TEXT = {
     "pending": "⏳ на проверке",
     "approved": "✅ опубликовано",
     "rejected": "❌ отклонено",
+    "withdrawn": "🗑 снято с публикации",
 }
 
 # ──────────────────────────── База данных ────────────────────────────
@@ -173,10 +175,26 @@ async def init_db() -> None:
                 photos        TEXT NOT NULL,
                 status        TEXT NOT NULL DEFAULT 'pending',
                 reject_reason TEXT,
-                created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                channel_chat_id TEXT,
+                channel_message_id INTEGER,
+                channel_message_ids TEXT,
+                views_clicks INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        # Миграция существующей базы без потери старых объявлений.
+        cur = await db.execute("PRAGMA table_info(ads)")
+        columns = {row[1] for row in await cur.fetchall()}
+        migrations = {
+            "channel_chat_id": "ALTER TABLE ads ADD COLUMN channel_chat_id TEXT",
+            "channel_message_id": "ALTER TABLE ads ADD COLUMN channel_message_id INTEGER",
+            "channel_message_ids": "ALTER TABLE ads ADD COLUMN channel_message_ids TEXT",
+            "views_clicks": "ALTER TABLE ads ADD COLUMN views_clicks INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                await db.execute(sql)
         await db.commit()
 
 
@@ -228,6 +246,25 @@ async def get_user_ads(user_id: int, limit: int = 10) -> list[dict]:
         return [_row_to_ad(r) for r in await cur.fetchall()]
 
 
+async def save_channel_post(ad_id: int, chat_id: int | str, message_ids: list[int], primary_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE ads SET channel_chat_id = ?, channel_message_id = ?, channel_message_ids = ? WHERE id = ?",
+            (str(chat_id), primary_id, json.dumps(message_ids), ad_id),
+        )
+        await db.commit()
+
+
+async def increment_ad_views(ad_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE ads SET views_clicks = views_clicks + 1 WHERE id = ? AND status = 'approved'",
+            (ad_id,),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
 async def set_status(
     ad_id: int,
     status: str,
@@ -266,20 +303,47 @@ def build_post(ad: dict) -> str:
     )
 
 
-async def send_ad(bot: Bot, chat_id: int | str, ad: dict) -> None:
-    """Отправляет объявление (фото + текст) в чат или канал.
-    Если текст не влезает в подпись — отправляет его отдельным сообщением."""
+async def send_ad(
+    bot: Bot,
+    chat_id: int | str,
+    ad: dict,
+    track_ad_id: int | None = None,
+) -> dict:
+    """Отправляет объявление. Для публикации в канале добавляет ссылку
+    на бота для подсчёта переходов и возвращает ID отправленных сообщений."""
     text = build_post(ad)
     photos = ad["photos"]
     fits = len(text) <= CAPTION_LIMIT
+    tracked = track_ad_id is not None and bool(BOT_USERNAME)
+
+    tracking_kb = None
+    if tracked:
+        kb = InlineKeyboardBuilder()
+        kb.button(
+            text="👁 Открыть карточку / статистика",
+            url=f"https://t.me/{BOT_USERNAME}?start=view_{track_ad_id}",
+        )
+        tracking_kb = kb.as_markup()
+
+    message_ids: list[int] = []
+    primary_id: int | None = None
 
     if len(photos) == 1:
         if fits:
-            await bot.send_photo(chat_id, photos[0], caption=text)
+            msg = await bot.send_photo(
+                chat_id, photos[0], caption=text, reply_markup=tracking_kb
+            )
+            message_ids.append(msg.message_id)
+            primary_id = msg.message_id
         else:
-            await bot.send_photo(chat_id, photos[0])
-            await bot.send_message(chat_id, text)
-        return
+            photo_msg = await bot.send_photo(chat_id, photos[0])
+            message_ids.append(photo_msg.message_id)
+            text_msg = await bot.send_message(
+                chat_id, text, reply_markup=tracking_kb
+            )
+            message_ids.append(text_msg.message_id)
+            primary_id = text_msg.message_id
+        return {"message_ids": message_ids, "primary_id": primary_id}
 
     media = [
         InputMediaPhoto(
@@ -289,9 +353,72 @@ async def send_ad(bot: Bot, chat_id: int | str, ad: dict) -> None:
         )
         for i, file_id in enumerate(photos)
     ]
-    await bot.send_media_group(chat_id, media)
-    if not fits:
-        await bot.send_message(chat_id, text)
+    sent = await bot.send_media_group(chat_id, media)
+    message_ids.extend(msg.message_id for msg in sent)
+
+    if tracked:
+        # У альбома Telegram не поддерживает inline-клавиатуру, поэтому
+        # добавляем отдельное сообщение со ссылкой на отслеживаемую карточку.
+        cta_text = "👁 Статистика и карточка этого объявления"
+        if not fits:
+            cta_text = text + "\n\n👁 Переходы по объявлению учитываются по кнопке ниже."
+        cta = await bot.send_message(chat_id, cta_text, reply_markup=tracking_kb)
+        message_ids.append(cta.message_id)
+        primary_id = cta.message_id
+    elif not fits:
+        text_msg = await bot.send_message(chat_id, text)
+        message_ids.append(text_msg.message_id)
+        primary_id = text_msg.message_id
+    else:
+        primary_id = sent[0].message_id
+
+    return {"message_ids": message_ids, "primary_id": primary_id}
+
+
+async def withdraw_channel_post(bot: Bot, ad: dict) -> bool:
+    """Заменяет публикацию уведомлением и удаляет остальные сообщения альбома."""
+    chat_id = ad.get("channel_chat_id")
+    primary_id = ad.get("channel_message_id")
+    raw_ids = ad.get("channel_message_ids")
+    if not chat_id or not primary_id:
+        return False
+
+    try:
+        ids = json.loads(raw_ids) if raw_ids else [primary_id]
+    except (TypeError, json.JSONDecodeError):
+        ids = [primary_id]
+
+    notice = (
+        "🗑 <b>Объявление снято с публикации</b>\n\n"
+        "Продавец больше не предлагает этот товар.\n"
+        "Публикация неактуальна."
+    )
+
+    edited = False
+    try:
+        await bot.edit_message_text(
+            notice, chat_id=chat_id, message_id=primary_id, reply_markup=None
+        )
+        edited = True
+    except TelegramAPIError:
+        try:
+            await bot.edit_message_caption(
+                notice, chat_id=chat_id, message_id=primary_id, reply_markup=None
+            )
+            edited = True
+        except TelegramAPIError:
+            log.exception("Не удалось изменить публикацию объявления #%s", ad["id"])
+            return False
+
+    # Удаляем фото/части альбома, оставляя только изменённое сообщение-уведомление.
+    for message_id in ids:
+        if message_id == primary_id:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramAPIError:
+            log.warning("Не удалось удалить сообщение %s объявления #%s", message_id, ad["id"])
+    return edited
 
 
 def ad_from_state(data: dict, user: User) -> dict:
@@ -314,8 +441,34 @@ async def safe_send(bot: Bot, chat_id: int, text: str) -> None:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+
+    if payload.startswith("view_"):
+        try:
+            ad_id = int(payload.removeprefix("view_"))
+        except ValueError:
+            ad_id = 0
+        ad = await get_ad(ad_id) if ad_id else None
+        if ad and ad["status"] == "approved":
+            await increment_ad_views(ad_id)
+            channel_url = make_channel_post_url(ad)
+            kb = InlineKeyboardBuilder()
+            if channel_url:
+                kb.button(text="📢 Перейти к объявлению в канале", url=channel_url)
+            await message.answer(
+                f"👁 Переход учтён.\n\n<b>{e(ad['title'])}</b>\n"
+                f"💰 Цена: {e(ad['price'])}\n"
+                f"📍 Город: {e(ad['city'])}",
+                reply_markup=kb.as_markup() if channel_url else None,
+            )
+            await message.answer("Вы также можете разместить собственное объявление.", reply_markup=menu_kb)
+            return
+        await message.answer("Это объявление больше не доступно.", reply_markup=menu_kb)
+        return
+
     await message.answer(
         "👋 Привет! Я помогу оформить объявление о продаже.\n\n"
         "Заполните короткую анкету, проверьте предпросмотр — и я отправлю "
@@ -348,17 +501,162 @@ async def cmd_new(message: Message, state: FSMContext) -> None:
 @router.message(Command("my"))
 @router.message(F.text == BTN_MY)
 async def cmd_my(message: Message) -> None:
-    ads = await get_user_ads(message.from_user.id)
+    ads = await get_user_ads(message.from_user.id, limit=20)
     if not ads:
         await message.answer("У вас пока нет объявлений.")
         return
-    lines = []
-    for a in ads:
-        line = f"#{a['id']} {e(a['title'])} — {STATUS_TEXT[a['status']]}"
-        if a["status"] == "rejected" and a["reject_reason"]:
-            line += f"\n   Причина: {e(a['reject_reason'])}"
-        lines.append(line)
-    await message.answer("\n".join(lines))
+
+    kb = InlineKeyboardBuilder()
+    for ad in ads:
+        status = STATUS_TEXT.get(ad["status"], ad["status"])
+        kb.button(
+            text=f"#{ad['id']} · {ad['title'][:35]} · {status}",
+            callback_data=f"myad:view:{ad['id']}",
+        )
+    kb.adjust(1)
+    await message.answer("📋 <b>Ваши объявления</b>\nВыберите объявление для просмотра и управления:", reply_markup=kb.as_markup())
+
+
+def make_channel_post_url(ad: dict) -> str | None:
+    """Формирует ссылку на пост публичного или приватного канала."""
+    message_id = ad.get("channel_message_id")
+    if not message_id:
+        return None
+    channel = str(ad.get("channel_chat_id") or CHANNEL_ID)
+    if channel.startswith("@"):
+        return f"https://t.me/{channel[1:]}/{message_id}"
+    if channel.startswith("-100"):
+        return f"https://t.me/c/{channel[4:]}/{message_id}"
+    return None
+
+
+async def show_user_ad(callback: CallbackQuery, ad_id: int) -> None:
+    ad = await get_ad(ad_id)
+    if not ad or ad["user_id"] != callback.from_user.id:
+        await callback.answer("Объявление не найдено или у вас нет доступа.", show_alert=True)
+        return
+
+    if len(ad["photos"]) == 1:
+        await callback.message.answer_photo(ad["photos"][0])
+    elif ad["photos"]:
+        media = [InputMediaPhoto(media=file_id) for file_id in ad["photos"]]
+        await callback.message.answer_media_group(media)
+
+    details = (
+        f"📱 <b>{e(ad['title'])}</b>\n\n"
+        f"💰 <b>Цена:</b> {e(ad['price'])}\n"
+        f"📍 <b>Город:</b> {e(ad['city'])}\n\n"
+        f"⚙️ <b>Характеристики:</b>\n{e(ad['specs'])}\n\n"
+        f"📝 <b>Описание:</b>\n{e(ad['description'])}\n\n"
+        f"⚠️ <b>Недочёты:</b>\n{e(ad['defects'])}\n\n"
+        f"📊 <b>Статус:</b> {STATUS_TEXT.get(ad['status'], ad['status'])}\n"
+        f"👁 <b>Переходы по ссылке:</b> {ad.get('views_clicks', 0)}\n"
+        f"📈 <b>Просмотры Telegram:</b> недоступны через стандартный Bot API"
+    )
+    kb = InlineKeyboardBuilder()
+    if ad["status"] == "approved":
+        if ad.get("channel_message_id"):
+            kb.button(text="🗑 Снять с публикации", callback_data=f"myad:remove:{ad_id}")
+        else:
+            details += "\n\nℹ️ Это объявление опубликовано до обновления бота. Управление старой публикацией пока недоступно."
+        post_url = make_channel_post_url(ad)
+        if post_url:
+            kb.button(text="📢 Открыть пост в канале", url=post_url)
+    kb.button(text="◀️ К списку объявлений", callback_data="myad:list")
+    kb.adjust(1)
+    await callback.message.answer(details, reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "myad:list")
+async def myad_list_callback(cb: CallbackQuery) -> None:
+    ads = await get_user_ads(cb.from_user.id, limit=20)
+    if not ads:
+        await cb.message.answer("У вас пока нет объявлений.")
+        await cb.answer()
+        return
+    kb = InlineKeyboardBuilder()
+    for ad in ads:
+        kb.button(
+            text=f"#{ad['id']} · {ad['title'][:35]} · {STATUS_TEXT.get(ad['status'], ad['status'])}",
+            callback_data=f"myad:view:{ad['id']}",
+        )
+    kb.adjust(1)
+    await cb.message.answer("📋 <b>Ваши объявления</b>", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("myad:view:"))
+async def myad_view(cb: CallbackQuery) -> None:
+    try:
+        ad_id = int(cb.data.rsplit(":", 1)[1])
+    except ValueError:
+        await cb.answer("Некорректный номер объявления.", show_alert=True)
+        return
+    await show_user_ad(cb, ad_id)
+
+
+@router.callback_query(F.data.startswith("myad:remove:"))
+async def myad_remove_confirm(cb: CallbackQuery) -> None:
+    try:
+        ad_id = int(cb.data.rsplit(":", 1)[1])
+    except ValueError:
+        await cb.answer("Некорректный номер объявления.", show_alert=True)
+        return
+    ad = await get_ad(ad_id)
+    if not ad or ad["user_id"] != cb.from_user.id:
+        await cb.answer("Нет доступа к этому объявлению.", show_alert=True)
+        return
+    if ad["status"] != "approved":
+        await cb.answer("Это объявление уже нельзя снять с публикации.", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Да, снять", callback_data=f"myad:confirm:{ad_id}")
+    kb.button(text="Отмена", callback_data=f"myad:view:{ad_id}")
+    kb.adjust(1)
+    await cb.message.answer(
+        f"⚠️ Снять объявление «{e(ad['title'])}» с публикации?\n"
+        "Пост в канале будет заменён уведомлением о снятии.",
+        reply_markup=kb.as_markup(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("myad:confirm:"))
+async def myad_remove_execute(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        ad_id = int(cb.data.rsplit(":", 1)[1])
+    except ValueError:
+        await cb.answer("Некорректный номер объявления.", show_alert=True)
+        return
+    ad = await get_ad(ad_id)
+    if not ad or ad["user_id"] != cb.from_user.id:
+        await cb.answer("Нет доступа к этому объявлению.", show_alert=True)
+        return
+    if ad["status"] != "approved":
+        await cb.answer("Объявление уже обработано.", show_alert=True)
+        return
+    if not ad.get("channel_message_id"):
+        await cb.answer(
+            "У этой старой публикации нет сохранённого ID сообщения. Обратитесь к администратору.",
+            show_alert=True,
+        )
+        return
+
+    if not await set_status(ad_id, "withdrawn", expected="approved"):
+        await cb.answer("Объявление уже обрабатывается.", show_alert=True)
+        return
+
+    if not await withdraw_channel_post(bot, ad):
+        await set_status(ad_id, "approved", expected="withdrawn")
+        await cb.answer("Не удалось изменить пост в канале. Статус восстановлен.", show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        f"✅ Объявление «{e(ad['title'])}» снято с публикации.\n"
+        f"Переходов по ссылке: {ad.get('views_clicks', 0)}"
+    )
+    await cb.answer("Публикация снята.")
 
 
 # ──────────────────────────── Заполнение анкеты ────────────────────────────
@@ -514,7 +812,10 @@ async def mod_approve(cb: CallbackQuery, bot: Bot) -> None:
 
     ad = await get_ad(ad_id)
     try:
-        await send_ad(bot, CHANNEL_ID, ad)
+        publication = await send_ad(bot, CHANNEL_ID, ad, track_ad_id=ad_id)
+        await save_channel_post(
+            ad_id, CHANNEL_ID, publication["message_ids"], publication["primary_id"]
+        )
     except TelegramAPIError as exc:
         await set_status(ad_id, "pending")  # откатываем
         log.exception("Не удалось опубликовать заявку #%s", ad_id)
@@ -594,6 +895,9 @@ async def main() -> None:
     await init_db()
 
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global BOT_USERNAME
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
     dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
 
