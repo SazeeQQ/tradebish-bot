@@ -76,6 +76,7 @@ e = html.escape  # экранирование пользовательского
 
 
 class Form(StatesGroup):
+    category = State()
     title = State()
     specs = State()
     description = State()
@@ -130,6 +131,17 @@ FIELDS = [
     ),
 ]
 FIELD_STATES = [f[1] for f in FIELDS]
+
+CATEGORIES = {
+    "smartphones": "📱 Смартфоны",
+    "tablets": "📲 Планшеты",
+    "laptops": "💻 Ноутбуки и ПК",
+    "wearables": "⌚ Смарт-часы",
+    "audio": "🎧 Наушники и аудио",
+    "gaming": "🎮 Игровая техника",
+    "accessories": "🔌 Аксессуары",
+    "other": "📦 Другое",
+}
 
 PHOTOS_PROMPT = (
     f"📸 Пришлите фото товара (до {MAX_PHOTOS} шт.).\n"
@@ -186,10 +198,18 @@ async def init_db() -> None:
         # Безопасные миграции: существующие объявления и база сохраняются.
         cur = await db.execute("PRAGMA table_info(ads)")
         columns = {row[1] for row in await cur.fetchall()}
-        for name, sql_type in (("channel_message_id", "INTEGER"), ("views", "INTEGER NOT NULL DEFAULT 0"), ("favorites_count", "INTEGER NOT NULL DEFAULT 0"), ("updated_at", "TEXT")):
+        for name, sql_type in (("channel_message_id", "INTEGER"), ("views", "INTEGER NOT NULL DEFAULT 0"), ("favorites_count", "INTEGER NOT NULL DEFAULT 0"), ("updated_at", "TEXT"), ("category", "TEXT NOT NULL DEFAULT 'other'")) :
             if name not in columns:
                 await db.execute(f"ALTER TABLE ads ADD COLUMN {name} {sql_type}")
         await db.executescript("""
+            CREATE TABLE IF NOT EXISTS safety_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ad_id INTEGER NOT NULL,
+                reporter_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(ad_id, reporter_id)
+            );
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id INTEGER NOT NULL, ad_id INTEGER NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -218,8 +238,8 @@ async def create_ad(ad: dict) -> int:
         cur = await db.execute(
             """
             INSERT INTO ads (user_id, username, title, specs, description,
-                             defects, city, price, photos)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             defects, city, price, photos, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ad["user_id"],
@@ -231,6 +251,7 @@ async def create_ad(ad: dict) -> int:
                 ad["city"],
                 ad["price"],
                 json.dumps(ad["photos"]),
+                ad.get("category", "other"),
             ),
         )
         await db.commit()
@@ -277,6 +298,19 @@ async def get_favorites(user_id: int) -> list[dict]:
         return [_row_to_ad(r) for r in await cur.fetchall()]
 
 
+async def create_safety_report(ad_id: int, reporter_id: int, reason: str) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            cur = await db.execute(
+                "INSERT INTO safety_reports(ad_id, reporter_id, reason) VALUES(?,?,?)",
+                (ad_id, reporter_id, reason[:500]),
+            )
+            await db.commit()
+            return cur.lastrowid
+        except aiosqlite.IntegrityError:
+            return None
+
+
 async def record_event(ad_id: int, user_id: int | None, event: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO ad_events(ad_id,user_id,event) VALUES(?,?,?)", (ad_id,user_id,event))
@@ -292,10 +326,13 @@ async def update_ad_status(ad_id: int, user_id: int, status: str) -> bool:
         return cur.rowcount == 1
 
 
-async def get_public_ads(limit: int = 10, offset: int = 0) -> list[dict]:
+async def get_public_ads(limit: int = 10, offset: int = 0, category: str | None = None) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM ads WHERE status='approved' ORDER BY id DESC LIMIT ? OFFSET ?", (limit,offset))
+        if category and category in CATEGORIES:
+            cur = await db.execute("SELECT * FROM ads WHERE status='approved' AND category=? ORDER BY id DESC LIMIT ? OFFSET ?", (category, limit, offset))
+        else:
+            cur = await db.execute("SELECT * FROM ads WHERE status='approved' ORDER BY id DESC LIMIT ? OFFSET ?", (limit,offset))
         return [_row_to_ad(r) for r in await cur.fetchall()]
 
 
@@ -324,13 +361,15 @@ async def set_status(
 def build_post(ad: dict) -> str:
     contact = "Связь с продавцом — через Trade Bish"
     return (
-        f"<b>{e(ad['title'])}</b>\n\n"
+        f"<b>{e(ad['title'])}</b>\n"
+        f"🏷 <b>Категория:</b> {e(CATEGORIES.get(ad.get('category', 'other'), CATEGORIES['other']))}\n\n"
         f"💰 <b>Цена:</b> {e(ad['price'])}\n"
         f"📍 <b>Город:</b> {e(ad['city'])}\n\n"
         f"⚙️ <b>Характеристики:</b>\n{e(ad['specs'])}\n\n"
         f"📝 <b>Описание:</b>\n{e(ad['description'])}\n\n"
         f"⚠️ <b>Недочёты:</b>\n{e(ad['defects'])}\n\n"
-        f"💬 <b>Связь:</b> {contact}"
+        f"💬 <b>Связь:</b> {contact}\n\n"
+        "🛡 <i>Проверяйте товар лично. Не переводите предоплату незнакомцам и не сообщайте коды из SMS.</i>"
     )
 
 
@@ -346,7 +385,8 @@ async def send_ad(bot: Bot, chat_id: int | str, ad: dict) -> None:
         kb.button(text="👁 Открыть / перейти", callback_data=f"visit:{ad['id']}")
         kb.button(text="💬 Написать продавцу", callback_data=f"contact:{ad['id']}")
         kb.button(text="♡ В избранное", callback_data=f"fav:{ad['id']}")
-        kb.adjust(1, 1, 1)
+        kb.button(text="🚨 Пожаловаться", callback_data=f"report:{ad['id']}")
+        kb.adjust(1, 1, 1, 1)
     markup = kb.as_markup() if isinstance(ad.get("id"), int) else None
     if len(photos) == 1:
         if fits:
@@ -377,6 +417,7 @@ def ad_from_state(data: dict, user: User) -> dict:
     return {
         "user_id": user.id,
         "username": user.username,
+        "category": data.get("category", "other"),
         **{k: data[k] for k in (f[0] for f in FIELDS)},
         "photos": data["photos"],
     }
@@ -396,23 +437,46 @@ async def safe_send(bot: Bot, chat_id: int, text: str) -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "👋 Привет! Я помогу оформить объявление о продаже.\n\n"
-        "Заполните короткую анкету, проверьте предпросмотр — и я отправлю "
-        "объявление на модерацию. После одобрения оно появится в канале.",
+        "👋 Добро пожаловать в Trade Bish — площадку для покупки, продажи и обмена техники.\n\n"
+        "Здесь можно найти смартфоны, ноутбуки, планшеты, аксессуары и другую электронику, сохранить объявления и безопаснее связаться с продавцом.\n\n"
+        "Публикации проходят модерацию. Trade Bish не принимает оплату и не выступает гарантом сделки — внимательно проверяйте товар и не переводите предоплату незнакомцам.",
         reply_markup=menu_kb,
     )
+
+
+def category_keyboard(prefix: str = "catalog"):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Все категории", callback_data=f"{prefix}:all")
+    for key, label in CATEGORIES.items():
+        kb.button(text=label, callback_data=f"{prefix}:{key}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+async def show_catalog(target, category: str | None = None) -> None:
+    ads = await get_public_ads(category=category)
+    title = "🛍 <b>Каталог Trade Bish</b>"
+    if category:
+        title += f"\nКатегория: {e(CATEGORIES.get(category, 'Другое'))}"
+    await target.answer(title)
+    if not ads:
+        await target.answer("В этой категории пока нет опубликованных объявлений.")
+        return
+    for ad in ads:
+        await send_ad(target.bot, target.chat.id, ad)
 
 
 @router.message(Command("catalog"))
 @router.message(F.text == "🛍 Каталог")
 async def cmd_catalog(message: Message) -> None:
-    ads = await get_public_ads()
-    if not ads:
-        await message.answer("Пока нет опубликованных объявлений. Загляните позже!")
-        return
-    await message.answer("🛍 <b>Свежие объявления</b>")
-    for ad in ads:
-        await send_ad(message.bot, message.chat.id, ad)
+    await message.answer("Выберите категорию техники для просмотра:", reply_markup=category_keyboard())
+
+
+@router.callback_query(F.data.startswith("catalog:"))
+async def catalog_category(cb: CallbackQuery) -> None:
+    value = cb.data.split(":", 1)[1]
+    await cb.answer()
+    await show_catalog(cb.message, None if value == "all" else value)
 
 
 @router.message(Command("favorites"))
@@ -460,6 +524,29 @@ async def favorite_callback(cb: CallbackQuery) -> None:
     await cb.answer("Добавлено в избранное ⭐" if added else "Удалено из избранного", show_alert=False)
 
 
+@router.callback_query(F.data.startswith("report:"))
+async def report_ad_callback(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        ad_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Некорректное объявление", show_alert=True)
+        return
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "approved":
+        await cb.answer("Объявление уже недоступно", show_alert=True)
+        return
+    if ad["user_id"] == cb.from_user.id:
+        await cb.answer("Нельзя пожаловаться на собственное объявление", show_alert=True)
+        return
+    report_id = await create_safety_report(ad_id, cb.from_user.id, "Подозрительное объявление — требуется проверка")
+    if report_id is None:
+        await cb.answer("Вы уже отправляли жалобу на это объявление", show_alert=True)
+        return
+    for admin_id in ADMIN_IDS:
+        await safe_send(bot, admin_id, f"🚨 <b>Жалоба #{report_id}</b>\nОбъявление: #{ad_id} — {e(ad['title'])}\nПользователь: <code>{cb.from_user.id}</code>\nПричина: подозрительное объявление — требуется проверка")
+    await cb.answer("Жалоба отправлена модераторам. Спасибо!", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("contact:"))
 async def contact_callback(cb: CallbackQuery, bot: Bot) -> None:
     ad_id = int(cb.data.split(":",1)[1])
@@ -470,15 +557,21 @@ async def contact_callback(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Это ваше объявление", show_alert=True); return
     await record_event(ad_id, cb.from_user.id, "contact")
     try:
-        await bot.send_message(ad["user_id"], f"💬 Покупатель заинтересовался объявлением <b>#{ad_id} {e(ad['title'])}</b>.\n\nПока доступно только уведомление о запросе контакта; встроенный чат будет отдельным следующим этапом.")
-        await cb.answer("Продавец уведомлён. Напишите ему в личном чате с ботом: /reply " + str(ad_id), show_alert=True)
+        await bot.send_message(cb.from_user.id, "🛡 <b>Памятка покупателю</b>\n\n• Не переводите предоплату незнакомому продавцу.\n• Встречайтесь в людном общественном месте.\n• Проверьте устройство лично: камеры, экран, связь, зарядку, аккаунты и блокировки.\n• Сверьте IMEI/серийный номер с настройками и коробкой.\n• Не сообщайте коды из SMS, пароли и данные банковской карты.\n• Если продавец торопит, уводит в сторонние мессенджеры или просит странную оплату — остановитесь и пожалуйтесь через кнопку 🚨.")
+        await bot.send_message(ad["user_id"], f"💬 Покупатель заинтересовался объявлением <b>#{ad_id} {e(ad['title'])}</b>.\n\n🛡 <b>Памятка продавцу</b>\n• Не переходите по подозрительным ссылкам «для получения оплаты».\n• Не сообщайте SMS-коды, пароли и данные карты.\n• Проверяйте поступление денег только в своём банковском приложении — скриншот не является подтверждением.\n• Передавайте товар после фактического получения оплаты или личной проверки при обмене.\n• Не соглашайтесь на сомнительные схемы с курьерами и «безопасной сделкой» вне официальных сервисов.")
+        await cb.answer("Продавец уведомлён. Перед сделкой ознакомьтесь с памяткой безопасности.", show_alert=True)
     except TelegramAPIError:
         await cb.answer("Продавец ещё не запускал бота. Попробуйте позже.", show_alert=True)
 
 
 @router.message(Command("reply"))
 async def reply_help(message: Message) -> None:
-    await message.answer("💬 Диалоги внутри бота будут доступны после следующего этапа обновления. Сейчас продавец получает уведомление о запросе, но прямой чат ещё не подключён.")
+    await message.answer("💬 Сейчас бот уведомляет продавца о запросе контакта. Для безопасности не отправляйте в переписке коды, пароли и данные банковских карт.")
+
+
+@router.message(Command("safety"))
+async def safety_command(message: Message) -> None:
+    await message.answer("🛡 <b>Безопасность Trade Bish</b>\n\n<b>Покупателю</b>\n• Не отправляйте предоплату незнакомцам.\n• Проверяйте устройство лично, включая IMEI, аккаунты и блокировки.\n• Встречайтесь в общественном месте.\n• Не сообщайте коды, пароли и данные карты.\n\n<b>Продавцу</b>\n• Проверяйте оплату в банковском приложении, а не по скриншоту.\n• Не открывайте ссылки для получения денег.\n• Не сообщайте коды подтверждения.\n• Фиксируйте состояние и комплект товара до передачи.\n\nTrade Bish модерирует объявления, но не хранит деньги и не гарантирует исход сделки. При подозрении нажмите 🚨 «Пожаловаться».")
 
 
 @router.callback_query(F.data.startswith("seller:"))
@@ -510,11 +603,24 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 async def begin_form(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await state.set_state(FIELDS[0][1])
+    await state.set_state(Form.category)
     await message.answer(
-        FIELDS[0][2] + "\n\n<i>/cancel — отмена</i>",
-        reply_markup=ReplyKeyboardRemove(),
+        "🏷 <b>Выберите категорию товара</b>\n\nОт этого зависит, где покупатели найдут ваше объявление.",
+        reply_markup=category_keyboard("adcat"),
     )
+
+
+@router.callback_query(Form.category, F.data.startswith("adcat:"))
+async def choose_ad_category(cb: CallbackQuery, state: FSMContext) -> None:
+    category = cb.data.split(":", 1)[1]
+    if category not in CATEGORIES:
+        await cb.answer("Выберите категорию из списка", show_alert=True)
+        return
+    await state.update_data(category=category)
+    await state.set_state(FIELDS[0][1])
+    await cb.message.edit_text(f"Категория: <b>{e(CATEGORIES[category])}</b>")
+    await cb.message.answer(FIELDS[0][2] + "\n\n<i>/cancel — отмена</i>")
+    await cb.answer("Категория выбрана")
 
 
 @router.message(Command("new"))
@@ -532,7 +638,7 @@ async def cmd_my(message: Message) -> None:
         return
     lines = []
     for a in ads:
-        line = f"#{a['id']} {e(a['title'])} — {STATUS_TEXT[a['status']]}"
+        line = f"#{a['id']} {e(a['title'])} · {e(CATEGORIES.get(a.get('category', 'other'), CATEGORIES['other']))} — {STATUS_TEXT[a['status']]}"
         if a["status"] == "rejected" and a["reject_reason"]:
             line += f"\n   Причина: {e(a['reject_reason'])}"
         lines.append(line)
@@ -714,7 +820,7 @@ async def mod_approve(cb: CallbackQuery, bot: Bot) -> None:
     )
     await cb.answer()
     await safe_send(
-        bot, ad["user_id"], f"🎉 Ваше объявление «{e(ad['title'])}» опубликовано! Теперь им можно управлять через /my, статистика — /stats."
+        bot, ad["user_id"], f"🎉 Ваше объявление «{e(ad['title'])}» опубликовано! Теперь им можно управлять через /my, статистика — /stats.\n\n🛡 Напоминание продавцу: не переходите по ссылкам для «получения оплаты», не сообщайте коды из SMS и отмечайте объявление «Продано» сразу после сделки, чтобы не вводить покупателей в заблуждение."
     )
 
 
