@@ -538,15 +538,18 @@ async def send_ad(
 
 
 async def withdraw_channel_post(bot: Bot, ad: dict) -> bool:
-    """Заменяет публикацию уведомлением и удаляет остальные сообщения альбома."""
+    """Заменяет публикацию уведомлением; при запрете редактирования использует резервную замену."""
     chat_id = ad.get("channel_chat_id")
     primary_id = ad.get("channel_message_id")
     raw_ids = ad.get("channel_message_ids")
     if not chat_id or not primary_id:
+        log.error("У объявления #%s отсутствуют channel_chat_id/channel_message_id", ad.get("id"))
         return False
 
     try:
         ids = json.loads(raw_ids) if raw_ids else [primary_id]
+        if not isinstance(ids, list) or not ids:
+            ids = [primary_id]
     except (TypeError, json.JSONDecodeError):
         ids = [primary_id]
 
@@ -556,31 +559,103 @@ async def withdraw_channel_post(bot: Bot, ad: dict) -> bool:
         "Публикация неактуальна."
     )
 
-    edited = False
+    # Определяем тип главного сообщения по тому, как send_ad сохраняет его:
+    # для одиночного фото с короткой подписью ID указывает на фото;
+    # для альбома с кнопкой или длинного объявления — на отдельное текстовое сообщение.
+    photos = ad.get("photos") or []
     try:
-        await bot.edit_message_text(
-            notice, chat_id=chat_id, message_id=primary_id, reply_markup=None
+        is_single_photo_caption = (
+            len(photos) == 1 and len(build_post(ad)) <= CAPTION_LIMIT
         )
-        edited = True
-    except TelegramAPIError:
-        try:
-            await bot.edit_message_caption(
-                notice, chat_id=chat_id, message_id=primary_id, reply_markup=None
-            )
-            edited = True
-        except TelegramAPIError:
-            log.exception("Не удалось изменить публикацию объявления #%s", ad["id"])
-            return False
+    except Exception:
+        is_single_photo_caption = False
 
-    # Удаляем фото/части альбома, оставляя только изменённое сообщение-уведомление.
+    primary_updated = False
+    try:
+        if is_single_photo_caption:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=primary_id,
+                caption=notice,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+            primary_updated = True
+        else:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=primary_id,
+                text=notice,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+            primary_updated = True
+    except TelegramAPIError as exc:
+        edit_error = exc
+        log.warning(
+            "Не удалось отредактировать основное сообщение объявления #%s: %s",
+            ad.get("id"), exc,
+        )
+
+        # На случай, если тип сообщения в старой записи отличается от ожидаемого,
+        # пробуем второй метод редактирования.
+        try:
+            if is_single_photo_caption:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=primary_id,
+                    text=notice,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            else:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=primary_id,
+                    caption=notice,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            primary_updated = True
+        except TelegramAPIError as exc:
+            edit_error = exc
+            log.warning(
+                "Оба способа редактирования не сработали для объявления #%s: %s",
+                ad.get("id"), exc,
+            )
+
+            # Резервный вариант: отправляем уведомление отдельным постом,
+            # затем удаляем прежние сообщения публикации.
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=notice,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except TelegramAPIError:
+                log.exception(
+                    "Не удалось отправить резервное уведомление по объявлению #%s",
+                    ad.get("id"),
+                )
+                return False
+
+    # После успешного редактирования/резервной публикации удаляем остальные
+    # элементы альбома и старые части объявления. Если прав на удаление нет,
+    # уведомление всё равно уже опубликовано/отредактировано.
     for message_id in ids:
-        if message_id == primary_id:
+        if message_id == primary_id and primary_updated:
             continue
         try:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except TelegramAPIError:
-            log.warning("Не удалось удалить сообщение %s объявления #%s", message_id, ad["id"])
-    return edited
+        except TelegramAPIError as exc:
+            log.warning(
+                "Не удалось удалить сообщение %s объявления #%s: %s",
+                message_id, ad.get("id"), exc,
+            )
+
+    return True
+
 
 
 def ad_from_state(data: dict, user: User) -> dict:
