@@ -537,4 +537,455 @@ async def cmd_favorites(message: Message) -> None:
         await send_ad(message.bot, message.chat.id, ad)
 
 
-@router.message(Command("sta
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    ads = await get_user_ads(message.from_user.id, 100)
+    if not ads:
+        await message.answer("У вас пока нет объявлений.")
+        return
+    total_views = sum(int(a.get("views") or 0) for a in ads)
+    total_favs = sum(int(a.get("favorites_count") or 0) for a in ads)
+    lines = [f"#{a['id']} · {e(a['title'])}\n{STATUS_TEXT.get(a['status'], a['status'])} · 👁 переходы: {a.get('views',0)} · ⭐ {a.get('favorites_count',0)}" for a in ads]
+    await message.answer("📊 <b>Статистика продавца</b>\n\n" + "\n\n".join(lines) + f"\n\nВсего просмотров: <b>{total_views}</b>\nДобавлений в избранное: <b>{total_favs}</b>")
+
+
+@router.callback_query(F.data.startswith("visit:"))
+async def visit_callback(cb: CallbackQuery) -> None:
+    ad_id = int(cb.data.split(":", 1)[1])
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "approved":
+        await cb.answer("Объявление уже недоступно", show_alert=True)
+        return
+    await record_event(ad_id, cb.from_user.id, "view")
+    await cb.answer("Переход учтён 👁")
+
+
+@router.callback_query(F.data.startswith("fav:"))
+async def favorite_callback(cb: CallbackQuery) -> None:
+    ad_id = int(cb.data.split(":",1)[1])
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "approved":
+        await cb.answer("Объявление уже недоступно", show_alert=True); return
+    added = await toggle_favorite(cb.from_user.id, ad_id)
+    await cb.answer("Добавлено в избранное ⭐" if added else "Удалено из избранного", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("report:"))
+async def report_ad_callback(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        ad_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Некорректное объявление", show_alert=True)
+        return
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "approved":
+        await cb.answer("Объявление уже недоступно", show_alert=True)
+        return
+    if ad["user_id"] == cb.from_user.id:
+        await cb.answer("Нельзя пожаловаться на собственное объявление", show_alert=True)
+        return
+    report_id = await create_safety_report(ad_id, cb.from_user.id, "Подозрительное объявление — требуется проверка")
+    if report_id is None:
+        await cb.answer("Вы уже отправляли жалобу на это объявление", show_alert=True)
+        return
+    for admin_id in ADMIN_IDS:
+        await safe_send(bot, admin_id, f"🚨 <b>Жалоба #{report_id}</b>\nОбъявление: #{ad_id} — {e(ad['title'])}\nПользователь: <code>{cb.from_user.id}</code>\nПричина: подозрительное объявление — требуется проверка")
+    await cb.answer("Жалоба отправлена модераторам. Спасибо!", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("contact:"))
+async def contact_callback(cb: CallbackQuery, bot: Bot) -> None:
+    ad_id = int(cb.data.split(":",1)[1])
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "approved":
+        await cb.answer("Объявление уже недоступно", show_alert=True); return
+    if cb.from_user.id == ad["user_id"]:
+        await cb.answer("Это ваше объявление", show_alert=True); return
+    await record_event(ad_id, cb.from_user.id, "contact")
+    try:
+        await bot.send_message(cb.from_user.id, "🛡 <b>Памятка покупателю</b>\n\n• Не переводите предоплату незнакомому продавцу.\n• Встречайтесь в людном общественном месте.\n• Проверьте устройство лично: камеры, экран, связь, зарядку, аккаунты и блокировки.\n• Сверьте IMEI/серийный номер с настройками и коробкой.\n• Не сообщайте коды из SMS, пароли и данные банковской карты.\n• Если продавец торопит, уводит в сторонние мессенджеры или просит странную оплату — остановитесь и пожалуйтесь через кнопку 🚨.")
+        await bot.send_message(ad["user_id"], f"💬 Покупатель заинтересовался объявлением <b>#{ad_id} {e(ad['title'])}</b>.\n\n🛡 <b>Памятка продавцу</b>\n• Не переходите по подозрительным ссылкам «для получения оплаты».\n• Не сообщайте SMS-коды, пароли и данные карты.\n• Проверяйте поступление денег только в своём банковском приложении — скриншот не является подтверждением.\n• Передавайте товар после фактического получения оплаты или личной проверки при обмене.\n• Не соглашайтесь на сомнительные схемы с курьерами и «безопасной сделкой» вне официальных сервисов.")
+        await cb.answer("Продавец уведомлён. Перед сделкой ознакомьтесь с памяткой безопасности.", show_alert=True)
+    except TelegramAPIError:
+        await cb.answer("Продавец ещё не запускал бота. Попробуйте позже.", show_alert=True)
+
+
+@router.message(Command("reply"))
+async def reply_help(message: Message) -> None:
+    await message.answer("💬 Сейчас бот уведомляет продавца о запросе контакта. Для безопасности не отправляйте в переписке коды, пароли и данные банковских карт.")
+
+
+@router.message(Command("safety"))
+async def safety_command(message: Message) -> None:
+    await message.answer("🛡 <b>Безопасность Trade Bish</b>\n\n<b>Покупателю</b>\n• Не отправляйте предоплату незнакомцам.\n• Проверяйте устройство лично, включая IMEI, аккаунты и блокировки.\n• Встречайтесь в общественном месте.\n• Не сообщайте коды, пароли и данные карты.\n\n<b>Продавцу</b>\n• Проверяйте оплату в банковском приложении, а не по скриншоту.\n• Не открывайте ссылки для получения денег.\n• Не сообщайте коды подтверждения.\n• Фиксируйте состояние и комплект товара до передачи.\n\nTrade Bish модерирует объявления, но не хранит деньги и не гарантирует исход сделки. При подозрении нажмите 🚨 «Пожаловаться».")
+
+
+@router.callback_query(F.data.startswith("seller:"))
+async def seller_actions(cb: CallbackQuery, bot: Bot) -> None:
+    _, action, raw_id = cb.data.split(":")
+    ad_id = int(raw_id); ad = await get_ad(ad_id)
+    if not ad or ad["user_id"] != cb.from_user.id:
+        await cb.answer("Объявление не найдено или нет доступа", show_alert=True); return
+    if action not in ("sold", "remove", "republish"):
+        await cb.answer("Неизвестное действие", show_alert=True); return
+    status = {"sold":"sold", "remove":"removed", "republish":"approved"}[action]
+    if not await update_ad_status(ad_id, cb.from_user.id, status):
+        await cb.answer("Действие доступно только для опубликованных объявлений", show_alert=True); return
+    try:
+        if ad.get("channel_message_id"):
+            notice = "🏁 ПРОДАНО" if status == "sold" else "🗑 ОБЪЯВЛЕНИЕ СНЯТО С ПУБЛИКАЦИИ"
+            await bot.edit_message_caption(chat_id=CHANNEL_ID, message_id=ad["channel_message_id"], caption=f"{notice}\n\n{e(ad['title'])}")
+    except TelegramAPIError:
+        log.warning("Не удалось обновить пост #%s в канале", ad_id)
+    await cb.message.edit_text(f"Объявление #{ad_id}: {STATUS_TEXT[status]}")
+    await cb.answer("Статус обновлён")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=menu_kb)
+
+
+async def begin_form(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(Form.category)
+    await message.answer(
+        "🏷 <b>Выберите категорию товара</b>\n\nОт этого зависит, где покупатели найдут ваше объявление.",
+        reply_markup=category_keyboard("adcat"),
+    )
+
+
+@router.callback_query(Form.category, F.data.startswith("adcat:"))
+async def choose_ad_category(cb: CallbackQuery, state: FSMContext) -> None:
+    category = cb.data.split(":", 1)[1]
+    if category not in CATEGORIES:
+        await cb.answer("Выберите категорию из списка", show_alert=True)
+        return
+    await state.update_data(category=category)
+    await state.set_state(FIELDS[0][1])
+    await cb.message.edit_text(f"Категория: <b>{e(CATEGORIES[category])}</b>")
+    await cb.message.answer(category_field_prompt("title", category) + "\n\n<i>/cancel — отмена</i>")
+    await cb.answer("Категория выбрана")
+
+
+@router.message(Command("new"))
+@router.message(F.text == BTN_NEW)
+async def cmd_new(message: Message, state: FSMContext) -> None:
+    await begin_form(message, state)
+
+
+@router.message(Command("my"))
+@router.message(F.text == BTN_MY)
+async def cmd_my(message: Message) -> None:
+    ads = await get_user_ads(message.from_user.id)
+    if not ads:
+        await message.answer("У вас пока нет объявлений.")
+        return
+    lines = []
+    for a in ads:
+        line = f"#{a['id']} {e(a['title'])} · {e(CATEGORIES.get(a.get('category', 'other'), CATEGORIES['other']))} — {STATUS_TEXT[a['status']]}"
+        if a["status"] == "rejected" and a["reject_reason"]:
+            line += f"\n   Причина: {e(a['reject_reason'])}"
+        lines.append(line)
+        if a["status"] == "approved":
+            kb = InlineKeyboardBuilder()
+            kb.button(text="🏁 Продано", callback_data=f"seller:sold:{a['id']}")
+            kb.button(text="🗑 Снять", callback_data=f"seller:remove:{a['id']}")
+            kb.adjust(2)
+            await message.answer(f"📦 <b>#{a['id']} {e(a['title'])}</b>\n{STATUS_TEXT[a['status']]}\n👁 переходы: {a.get('views',0)} · ⭐ {a.get('favorites_count',0)}", reply_markup=kb.as_markup())
+    await message.answer("\n".join(lines))
+
+
+# ──────────────────────────── Заполнение анкеты ────────────────────────────
+
+
+@router.message(StateFilter(*FIELD_STATES), F.text)
+async def collect_field(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    idx = next(i for i, f in enumerate(FIELDS) if f[1].state == current)
+    key, _, _, limit = FIELDS[idx]
+
+    value = message.text.strip()
+    if len(value) > limit:
+        await message.answer(f"Слишком длинно — максимум {limit} символов. Сократите, пожалуйста.")
+        return
+    if key == "price" and not any(ch.isdigit() for ch in value):
+        await message.answer("Укажите цену цифрами, например: <i>45 000 ₽</i>")
+        return
+
+    await state.update_data(**{key: value})
+
+    if idx + 1 < len(FIELDS):
+        next_key, next_state, prompt, _ = FIELDS[idx + 1]
+        data = await state.get_data()
+        category = data.get("category", "other")
+        category_prompt = category_field_prompt(next_key, category)
+        await state.set_state(next_state)
+        await message.answer(category_prompt or prompt)
+    else:
+        await state.set_state(Form.photos)
+        await state.update_data(photos=[])
+        await message.answer(PHOTOS_PROMPT, reply_markup=done_kb)
+
+
+@router.message(StateFilter(*FIELD_STATES))
+async def field_not_text(message: Message) -> None:
+    await message.answer("Пожалуйста, ответьте текстом.")
+
+
+@router.message(Form.photos, F.photo)
+async def add_photo(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    photos: list[str] = data.get("photos", [])
+    if len(photos) >= MAX_PHOTOS:
+        await message.answer(f"Максимум {MAX_PHOTOS} фото. Нажмите «{BTN_DONE}».")
+        return
+    photos.append(message.photo[-1].file_id)  # самое большое разрешение
+    await state.update_data(photos=photos)
+    await message.answer(f"📸 Фото {len(photos)}/{MAX_PHOTOS} принято.")
+
+
+@router.message(Form.photos, F.text == BTN_DONE)
+async def photos_done(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    if not data.get("photos"):
+        await message.answer("Нужно хотя бы одно фото товара.")
+        return
+
+    await state.set_state(Form.confirm)
+    ad = ad_from_state(data, message.from_user)
+
+    await message.answer(
+        "👀 Так объявление увидят подписчики канала:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await send_ad(bot, message.chat.id, ad)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📨 Отправить на проверку", callback_data="ad:submit")
+    kb.button(text="🔄 Заполнить заново", callback_data="ad:restart")
+    kb.button(text="🚫 Отмена", callback_data="ad:cancel")
+    kb.adjust(1)
+    await message.answer("Всё верно?", reply_markup=kb.as_markup())
+
+
+@router.message(Form.photos)
+async def photos_fallback(message: Message) -> None:
+    await message.answer(f"Пришлите фото или нажмите «{BTN_DONE}».")
+
+
+@router.message(Form.confirm)
+async def confirm_fallback(message: Message) -> None:
+    await message.answer("Используйте кнопки под предпросмотром или /cancel.")
+
+
+# ──────────────────────────── Подтверждение ────────────────────────────
+
+
+async def notify_admins(bot: Bot, ad_id: int, ad: dict) -> None:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Опубликовать", callback_data=f"mod:approve:{ad_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"mod:reject:{ad_id}")
+    kb.adjust(2)
+    for admin_id in ADMIN_IDS:
+        try:
+            await send_ad(bot, admin_id, ad)
+            await bot.send_message(
+                admin_id,
+                f"🆕 Заявка #{ad_id} на модерации",
+                reply_markup=kb.as_markup(),
+            )
+        except TelegramAPIError:
+            log.exception("Не удалось отправить заявку модератору %s", admin_id)
+
+
+@router.callback_query(Form.confirm, F.data == "ad:submit")
+async def ad_submit(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    ad = ad_from_state(data, cb.from_user)
+    ad_id = await create_ad(ad)
+    await state.clear()
+
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer(
+        f"✅ Заявка #{ad_id} отправлена на проверку. Я сообщу о решении.",
+        reply_markup=menu_kb,
+    )
+    await cb.answer()
+    await notify_admins(bot, ad_id, ad)
+
+
+@router.callback_query(Form.confirm, F.data == "ad:restart")
+async def ad_restart(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer()
+    await begin_form(cb.message, state)
+
+
+@router.callback_query(Form.confirm, F.data == "ad:cancel")
+async def ad_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer("Отменено.", reply_markup=menu_kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("ad:"))
+async def ad_stale(cb: CallbackQuery) -> None:
+    await cb.answer("Эта анкета уже неактуальна. Начните заново: /new", show_alert=True)
+
+
+# ──────────────────────────── Модерация ────────────────────────────
+
+
+@router.callback_query(F.data.startswith("mod:approve:"))
+async def mod_approve(cb: CallbackQuery, bot: Bot) -> None:
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    ad_id = int(cb.data.rsplit(":", 1)[1])
+    # атомарно "занимаем" заявку, чтобы не опубликовать дважды
+    if not await set_status(ad_id, "approved", expected="pending"):
+        await cb.answer("Заявка уже обработана", show_alert=True)
+        return
+
+    ad = await get_ad(ad_id)
+    try:
+        sent = await send_ad(bot, CHANNEL_ID, ad)
+        if sent:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE ads SET channel_message_id=? WHERE id=?", (sent.message_id, ad_id))
+                await db.commit()
+    except TelegramAPIError as exc:
+        await set_status(ad_id, "pending")  # заявка остаётся доступной для повторной публикации
+        log.exception("Не удалось опубликовать заявку #%s в канал %s", ad_id, CHANNEL_ID)
+        error_text = str(exc)
+        if "chat not found" in error_text.lower():
+            user_error = (
+                f"Не удалось найти канал {CHANNEL_URL}. Проверьте ссылку канала, "
+                "добавление бота в канал и права администратора."
+            )
+        elif "not enough rights" in error_text.lower() or "forbidden" in error_text.lower():
+            user_error = (
+                f"У бота нет прав на публикацию в канале {CHANNEL_URL}. "
+                "Назначьте его администратором и разрешите публикацию сообщений."
+            )
+        else:
+            user_error = f"Ошибка Telegram при публикации: {error_text}"
+        await cb.answer(user_error[:190], show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        f"✅ Заявка #{ad_id} опубликована\nМодератор: {e(cb.from_user.full_name)}"
+    )
+    await cb.answer()
+    await safe_send(
+        bot, ad["user_id"], f"🎉 Ваше объявление «{e(ad['title'])}» опубликовано! Теперь им можно управлять через /my, статистика — /stats.\n\n🛡 Напоминание продавцу: не переходите по ссылкам для «получения оплаты», не сообщайте коды из SMS и отмечайте объявление «Продано» сразу после сделки, чтобы не вводить покупателей в заблуждение."
+    )
+
+
+@router.callback_query(F.data.startswith("mod:reject:"))
+async def mod_reject_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    ad_id = int(cb.data.rsplit(":", 1)[1])
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "pending":
+        await cb.answer("Заявка уже обработана", show_alert=True)
+        return
+
+    await state.set_state(Reject.reason)
+    await state.update_data(
+        ad_id=ad_id,
+        chat_id=cb.message.chat.id,
+        message_id=cb.message.message_id,
+    )
+    await cb.message.answer(
+        f"Напишите причину отклонения заявки #{ad_id} — её получит продавец.\n"
+        "/skip — без причины, /cancel — отмена."
+    )
+    await cb.answer()
+
+
+@router.message(Reject.reason, F.text)
+async def mod_reject_finish(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    await state.clear()
+
+    ad_id = data["ad_id"]
+    text = message.text.strip()
+    reason = None if text == "/skip" else text[:500]
+
+    if not await set_status(ad_id, "rejected", reason, expected="pending"):
+        await message.answer("Заявка уже обработана другим модератором.")
+        return
+
+    ad = await get_ad(ad_id)
+    notice = f"❌ Ваше объявление «{e(ad['title'])}» не прошло проверку."
+    if reason:
+        notice += f"\nПричина: {e(reason)}"
+    notice += "\n\nИсправьте и отправьте заново: /new"
+    await safe_send(bot, ad["user_id"], notice)
+
+    try:
+        await bot.edit_message_text(
+            f"❌ Заявка #{ad_id} отклонена\nМодератор: {e(message.from_user.full_name)}",
+            chat_id=data["chat_id"],
+            message_id=data["message_id"],
+        )
+    except TelegramAPIError:
+        pass
+    await message.answer(f"Заявка #{ad_id} отклонена, продавец уведомлён.")
+
+
+# ──────────────────────────── Запуск ────────────────────────────
+
+
+async def check_publication_channel(bot: Bot) -> None:
+    """Проверяет доступность канала и права бота до начала работы."""
+    try:
+        chat = await bot.get_chat(CHANNEL_ID)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        status = getattr(member, "status", "unknown")
+        if status != "administrator" and str(status) != "ChatMemberStatus.ADMINISTRATOR":
+            log.error(
+                "Бот найден в канале %s, но не является администратором (status=%s). "
+                "Назначьте бота администратором с правом публикации.",
+                getattr(chat, "username", None) or chat.id, status,
+            )
+            return
+        if getattr(member, "can_post_messages", True) is False:
+            log.error("У бота отключено право публикации сообщений в канале %s", chat.id)
+            return
+        log.info(
+            "Канал публикаций доступен: %s (chat_id=%s); бот имеет права администратора.",
+            f"@{chat.username}" if chat.username else chat.title, chat.id,
+        )
+    except TelegramAPIError as exc:
+        log.error(
+            "Не удалось проверить канал публикаций %s: %s. Проверьте CHANNEL_ID, "
+            "добавление бота в канал и права администратора.", CHANNEL_ID, exc,
+        )
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    await init_db()
+
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await check_publication_channel(bot)
+
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
