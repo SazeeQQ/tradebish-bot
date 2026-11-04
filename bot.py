@@ -90,13 +90,17 @@ class Reject(StatesGroup):
     reason = State()
 
 
+class Report(StatesGroup):
+    reason = State()
+
+
 # (ключ, состояние, вопрос, макс. длина)
 FIELDS = [
     (
         "title",
         Form.title,
         "📱 Что продаёте? Напишите название и модель.\n\n"
-        "Например: <i>iPhone 13, чёрный</i>",
+        "Например: <i>iPhone 13 128 ГБ, чёрный</i>",
         100,
     ),
     (
@@ -138,10 +142,11 @@ PHOTOS_PROMPT = (
 
 BTN_NEW = "➕ Новое объявление"
 BTN_MY = "📋 Мои объявления"
+BTN_DIALOGS = "💬 Мои диалоги"
 BTN_DONE = "✅ Готово"
 
 menu_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_MY)]],
+    keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_MY)], [KeyboardButton(text=BTN_DIALOGS)]],
     resize_keyboard=True,
 )
 done_kb = ReplyKeyboardMarkup(
@@ -195,6 +200,45 @@ async def init_db() -> None:
         for column, sql in migrations.items():
             if column not in columns:
                 await db.execute(sql)
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ad_id INTEGER NOT NULL,
+                buyer_id INTEGER NOT NULL,
+                seller_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(ad_id, buyer_id)
+            )"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                message_type TEXT NOT NULL,
+                content TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS chat_active (
+                user_id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL
+            )"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS complaints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                ad_id INTEGER NOT NULL,
+                reporter_id INTEGER NOT NULL,
+                reported_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
         await db.commit()
 
 
@@ -265,6 +309,123 @@ async def increment_ad_views(ad_id: int) -> bool:
         return cur.rowcount == 1
 
 
+async def get_or_create_conversation(ad_id: int, buyer_id: int, seller_id: int) -> tuple[dict, bool]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM conversations WHERE ad_id = ? AND buyer_id = ?",
+            (ad_id, buyer_id),
+        )
+        row = await cur.fetchone()
+        created = False
+        if row is None:
+            cur = await db.execute(
+                "INSERT INTO conversations (ad_id, buyer_id, seller_id) VALUES (?, ?, ?)",
+                (ad_id, buyer_id, seller_id),
+            )
+            await db.commit()
+            cur = await db.execute("SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,))
+            row = await cur.fetchone()
+            created = True
+        return dict(row), created
+
+
+async def get_conversation(conversation_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def set_active_chat(user_id: int, conversation_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chat_active (user_id, conversation_id) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET conversation_id = excluded.conversation_id",
+            (user_id, conversation_id),
+        )
+        await db.commit()
+
+
+async def get_active_chat(user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT c.* FROM chat_active a JOIN conversations c ON c.id = a.conversation_id "
+            "WHERE a.user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def close_conversation(conversation_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE conversations SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (conversation_id,),
+        )
+        await db.execute("DELETE FROM chat_active WHERE conversation_id = ?", (conversation_id,))
+        await db.commit()
+
+
+async def reopen_conversation(conversation_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE conversations SET status = 'open', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (conversation_id,),
+        )
+        await db.commit()
+
+
+async def list_user_conversations(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT c.*, a.title AS ad_title FROM conversations c "
+            "JOIN ads a ON a.id = c.ad_id "
+            "WHERE c.buyer_id = ? OR c.seller_id = ? "
+            "ORDER BY c.updated_at DESC, c.id DESC LIMIT 30",
+            (user_id, user_id),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def save_chat_message(conversation_id: int, sender_id: int, message_type: str, content: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chat_messages (conversation_id, sender_id, message_type, content) VALUES (?, ?, ?, ?)",
+            (conversation_id, sender_id, message_type, content[:1500]),
+        )
+        await db.execute(
+            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (conversation_id,),
+        )
+        await db.commit()
+
+
+async def get_chat_transcript(conversation_id: int, limit: int = 30) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+            (conversation_id, limit),
+        )
+        rows = await cur.fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+
+async def create_complaint(conversation: dict, reporter_id: int, reason: str) -> int:
+    reported_id = conversation["seller_id"] if reporter_id == conversation["buyer_id"] else conversation["buyer_id"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO complaints (conversation_id, ad_id, reporter_id, reported_id, reason) VALUES (?, ?, ?, ?, ?)",
+            (conversation["id"], conversation["ad_id"], reporter_id, reported_id, reason[:1000]),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
 async def set_status(
     ad_id: int,
     status: str,
@@ -288,10 +449,6 @@ async def set_status(
 
 
 def build_post(ad: dict) -> str:
-    if ad["username"]:
-        contact = f"@{e(ad['username'])}"
-    else:
-        contact = f'<a href="tg://user?id={ad["user_id"]}">написать продавцу</a>'
     return (
         f"<b>{e(ad['title'])}</b>\n\n"
         f"💰 <b>Цена:</b> {e(ad['price'])}\n"
@@ -299,7 +456,7 @@ def build_post(ad: dict) -> str:
         f"⚙️ <b>Характеристики:</b>\n{e(ad['specs'])}\n\n"
         f"📝 <b>Описание:</b>\n{e(ad['description'])}\n\n"
         f"⚠️ <b>Недочёты:</b>\n{e(ad['defects'])}\n\n"
-        f"👤 <b>Продавец:</b> {contact}"
+        "💬 <b>Связь с продавцом:</b> через Trade Bish"
     )
 
 
@@ -320,9 +477,14 @@ async def send_ad(
     if tracked:
         kb = InlineKeyboardBuilder()
         kb.button(
-            text="👁 Открыть карточку / статистика",
+            text="👁 Открыть карточку",
             url=f"https://t.me/{BOT_USERNAME}?start=view_{track_ad_id}",
         )
+        kb.button(
+            text="💬 Написать продавцу",
+            url=f"https://t.me/{BOT_USERNAME}?start=contact_{track_ad_id}",
+        )
+        kb.adjust(1)
         tracking_kb = kb.as_markup()
 
     message_ids: list[int] = []
@@ -437,6 +599,77 @@ async def safe_send(bot: Bot, chat_id: int, text: str) -> None:
         log.warning("Не удалось отправить сообщение пользователю %s", chat_id)
 
 
+# ──────────────────────────── Внутренние диалоги ────────────────────────────
+
+
+def chat_controls(conversation: dict):
+    kb = InlineKeyboardBuilder()
+    if conversation["status"] == "open":
+        kb.button(text="⏹ Завершить диалог", callback_data=f"chat:close:{conversation['id']}")
+        kb.button(text="🚨 Пожаловаться", callback_data=f"chat:report:{conversation['id']}")
+    else:
+        kb.button(text="↩️ Продолжить диалог", callback_data=f"chat:resume:{conversation['id']}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def send_chat_panel(bot: Bot, user_id: int, conversation: dict, note: str | None = None) -> None:
+    ad = await get_ad(conversation["ad_id"])
+    if not ad:
+        await safe_send(bot, user_id, "Объявление больше не найдено.")
+        return
+    role = "покупатель" if user_id == conversation["buyer_id"] else "продавец"
+    peer = "продавцом" if role == "покупатель" else "покупателем"
+    status = "🟢 Диалог активен" if conversation["status"] == "open" else "⚪ Диалог завершён"
+    text = (
+        f"💬 <b>Диалог по объявлению #{ad['id']}</b>\n"
+        f"📱 {e(ad['title'])}\n"
+        f"Вы: {role}. Собеседник: {peer}.\n"
+        f"{status}\n\n"
+        "Отправляйте сюда текст, фотографии, видео или документы — бот передаст их собеседнику.\n"
+        "Чтобы вернуться к переписке позже, откройте «Мои диалоги»."
+    )
+    if note:
+        text = note + "\n\n" + text
+    await bot.send_message(user_id, text, reply_markup=chat_controls(conversation))
+
+
+async def begin_contact(bot: Bot, user_id: int, ad_id: int) -> None:
+    ad = await get_ad(ad_id)
+    if not ad or ad["status"] != "approved":
+        await safe_send(bot, user_id, "Это объявление больше не доступно.")
+        return
+    if ad["user_id"] == user_id:
+        await safe_send(bot, user_id, "Это ваше объявление — написать самому себе нельзя.")
+        return
+    conversation, created = await get_or_create_conversation(ad_id, user_id, ad["user_id"])
+    if conversation["status"] == "open":
+        await set_active_chat(user_id, conversation["id"])
+        await set_active_chat(ad["user_id"], conversation["id"])
+        await send_chat_panel(bot, user_id, conversation, "✅ Диалог открыт. Напишите продавцу сообщение.")
+        if created:
+            await send_chat_panel(bot, ad["user_id"], conversation, "🆕 Покупатель заинтересовался вашим объявлением.")
+        return
+    await send_chat_panel(bot, user_id, conversation, "ℹ️ У вас уже есть завершённый диалог по этому объявлению.")
+
+
+async def show_dialogs(message: Message) -> None:
+    dialogs = await list_user_conversations(message.from_user.id)
+    if not dialogs:
+        await message.answer("У вас пока нет диалогов.", reply_markup=menu_kb)
+        return
+    kb = InlineKeyboardBuilder()
+    for dialog in dialogs:
+        state = "🟢" if dialog["status"] == "open" else "⚪"
+        title = (dialog.get("ad_title") or "Объявление")[:32]
+        kb.button(
+            text=f"{state} #{dialog['id']} · {title}",
+            callback_data=f"chat:open:{dialog['id']}",
+        )
+    kb.adjust(1)
+    await message.answer("💬 <b>Ваши диалоги</b>\nВыберите переписку, чтобы продолжить или открыть её снова:", reply_markup=kb.as_markup())
+
+
 # ──────────────────────────── Общие команды ────────────────────────────
 
 
@@ -454,27 +687,48 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
         ad = await get_ad(ad_id) if ad_id else None
         if ad and ad["status"] == "approved":
             await increment_ad_views(ad_id)
-            channel_url = make_channel_post_url(ad)
-            kb = InlineKeyboardBuilder()
-            if channel_url:
-                kb.button(text="📢 Перейти к объявлению в канале", url=channel_url)
             await message.answer(
                 f"👁 Переход учтён.\n\n<b>{e(ad['title'])}</b>\n"
-                f"💰 Цена: {e(ad['price'])}\n"
-                f"📍 Город: {e(ad['city'])}",
-                reply_markup=kb.as_markup() if channel_url else None,
+                f"💰 Цена: {e(ad['price'])}\n📍 Город: {e(ad['city'])}",
+                reply_markup=menu_kb,
             )
-            await message.answer("Вы также можете разместить собственное объявление.", reply_markup=menu_kb)
+            await begin_contact_hint(message, ad_id)
             return
         await message.answer("Это объявление больше не доступно.", reply_markup=menu_kb)
         return
 
+    if payload.startswith("contact_"):
+        try:
+            ad_id = int(payload.removeprefix("contact_"))
+        except ValueError:
+            ad_id = 0
+        if ad_id:
+            await begin_contact(bot, message.from_user.id, ad_id)
+            return
+
+    if payload.startswith("dialog_"):
+        try:
+            conversation_id = int(payload.removeprefix("dialog_"))
+        except ValueError:
+            conversation_id = 0
+        if conversation_id:
+            conversation = await get_conversation(conversation_id)
+            if conversation and message.from_user.id in (conversation["buyer_id"], conversation["seller_id"]):
+                await set_active_chat(message.from_user.id, conversation_id)
+                await send_chat_panel(bot, message.from_user.id, conversation)
+                return
+
     await message.answer(
-        "👋 Привет! Я помогу оформить объявление о продаже.\n\n"
-        "Заполните короткую анкету, проверьте предпросмотр — и я отправлю "
-        "объявление на модерацию. После одобрения оно появится в канале.",
+        "👋 Добро пожаловать в Trade Bish!\n\n"
+        "Здесь можно публиковать объявления, управлять ими и общаться с продавцами через внутренние диалоги.",
         reply_markup=menu_kb,
     )
+
+
+async def begin_contact_hint(message: Message, ad_id: int) -> None:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Написать продавцу", url=f"https://t.me/{BOT_USERNAME}?start=contact_{ad_id}")
+    await message.answer("Хотите задать продавцу вопрос? Общение проходит через бота.", reply_markup=kb.as_markup())
 
 
 @router.message(Command("cancel"))
@@ -515,6 +769,12 @@ async def cmd_my(message: Message) -> None:
         )
     kb.adjust(1)
     await message.answer("📋 <b>Ваши объявления</b>\nВыберите объявление для просмотра и управления:", reply_markup=kb.as_markup())
+
+
+@router.message(Command("dialogs"))
+@router.message(F.text == BTN_DIALOGS)
+async def cmd_dialogs(message: Message) -> None:
+    await show_dialogs(message)
 
 
 def make_channel_post_url(ad: dict) -> str | None:
@@ -657,6 +917,137 @@ async def myad_remove_execute(cb: CallbackQuery, bot: Bot) -> None:
         f"Переходов по ссылке: {ad.get('views_clicks', 0)}"
     )
     await cb.answer("Публикация снята.")
+
+
+# ──────────────────────────── Обработчики диалогов ────────────────────────────
+
+
+@router.callback_query(F.data.startswith("chat:open:"))
+async def chat_open(cb: CallbackQuery, bot: Bot) -> None:
+    conversation_id = int(cb.data.rsplit(":", 1)[1])
+    conversation = await get_conversation(conversation_id)
+    if not conversation or cb.from_user.id not in (conversation["buyer_id"], conversation["seller_id"]):
+        await cb.answer("Диалог не найден или нет доступа.", show_alert=True)
+        return
+    if conversation["status"] == "open":
+        await set_active_chat(cb.from_user.id, conversation_id)
+    await send_chat_panel(bot, cb.from_user.id, conversation)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("chat:close:"))
+async def chat_close(cb: CallbackQuery, bot: Bot) -> None:
+    conversation_id = int(cb.data.rsplit(":", 1)[1])
+    conversation = await get_conversation(conversation_id)
+    if not conversation or cb.from_user.id not in (conversation["buyer_id"], conversation["seller_id"]):
+        await cb.answer("Диалог не найден или нет доступа.", show_alert=True)
+        return
+    if conversation["status"] == "open":
+        await close_conversation(conversation_id)
+        conversation = await get_conversation(conversation_id)
+        other_id = conversation["seller_id"] if cb.from_user.id == conversation["buyer_id"] else conversation["buyer_id"]
+        await safe_send(bot, other_id, f"⏹ Собеседник завершил диалог по объявлению #{conversation['ad_id']}. Его можно возобновить через «Мои диалоги».")
+    await send_chat_panel(bot, cb.from_user.id, conversation, "Диалог завершён. Переписка сохранена.")
+    await cb.answer("Диалог завершён.")
+
+
+@router.callback_query(F.data.startswith("chat:resume:"))
+async def chat_resume(cb: CallbackQuery, bot: Bot) -> None:
+    conversation_id = int(cb.data.rsplit(":", 1)[1])
+    conversation = await get_conversation(conversation_id)
+    if not conversation or cb.from_user.id not in (conversation["buyer_id"], conversation["seller_id"]):
+        await cb.answer("Диалог не найден или нет доступа.", show_alert=True)
+        return
+    await reopen_conversation(conversation_id)
+    await set_active_chat(conversation["buyer_id"], conversation_id)
+    await set_active_chat(conversation["seller_id"], conversation_id)
+    conversation = await get_conversation(conversation_id)
+    other_id = conversation["seller_id"] if cb.from_user.id == conversation["buyer_id"] else conversation["buyer_id"]
+    await safe_send(bot, other_id, f"↩️ Собеседник возобновил диалог по объявлению #{conversation['ad_id']}.")
+    await send_chat_panel(bot, cb.from_user.id, conversation, "Диалог возобновлён.")
+    await cb.answer("Диалог открыт.")
+
+
+@router.callback_query(F.data.startswith("chat:report:"))
+async def chat_report_start(cb: CallbackQuery, state: FSMContext) -> None:
+    conversation_id = int(cb.data.rsplit(":", 1)[1])
+    conversation = await get_conversation(conversation_id)
+    if not conversation or cb.from_user.id not in (conversation["buyer_id"], conversation["seller_id"]):
+        await cb.answer("Диалог не найден или нет доступа.", show_alert=True)
+        return
+    await state.set_state(Report.reason)
+    await state.update_data(conversation_id=conversation_id)
+    await cb.message.answer("🚨 Опишите жалобу. Укажите, что произошло и почему вы считаете действия собеседника нарушением.\n/cancel — отмена.")
+    await cb.answer()
+
+
+@router.message(Report.reason, F.text)
+async def chat_report_finish(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    conversation_id = data.get("conversation_id")
+    conversation = await get_conversation(conversation_id) if conversation_id else None
+    await state.clear()
+    if not conversation or message.from_user.id not in (conversation["buyer_id"], conversation["seller_id"]):
+        await message.answer("Не удалось найти диалог для жалобы.", reply_markup=menu_kb)
+        return
+    reason = message.text.strip()[:1000]
+    if len(reason) < 5:
+        await message.answer("Пожалуйста, опишите ситуацию чуть подробнее (минимум 5 символов).")
+        await state.set_state(Report.reason)
+        await state.update_data(conversation_id=conversation_id)
+        return
+    complaint_id = await create_complaint(conversation, message.from_user.id, reason)
+    ad = await get_ad(conversation["ad_id"])
+    transcript = await get_chat_transcript(conversation_id, limit=25)
+    transcript_text = "\n".join(
+        f"{('Покупатель' if item['sender_id'] == conversation['buyer_id'] else 'Продавец')}: {e(item['content'] or '[' + item['message_type'] + ']')}"
+        for item in transcript
+    ) or "Переписки пока нет."
+    report_text = (
+        f"🚨 <b>Жалоба #{complaint_id}</b>\n"
+        f"Диалог: #{conversation_id}\nОбъявление: #{conversation['ad_id']} — {e(ad['title'] if ad else 'не найдено')}\n"
+        f"Заявитель ID: <code>{message.from_user.id}</code>\n"
+        f"На кого жалоба ID: <code>{conversation['seller_id'] if message.from_user.id == conversation['buyer_id'] else conversation['buyer_id']}</code>\n\n"
+        f"<b>Причина:</b> {e(reason)}\n\n<b>Последние сообщения:</b>\n{transcript_text[:3500]}"
+    )
+    for admin_id in ADMIN_IDS:
+        await safe_send(bot, admin_id, report_text)
+    await message.answer(f"✅ Жалоба #{complaint_id} отправлена модераторам. Спасибо за обращение.", reply_markup=menu_kb)
+
+
+@router.message(StateFilter(None), F.chat.type == "private")
+async def relay_chat_message(message: Message, bot: Bot) -> None:
+    if message.text and message.text.startswith("/"):
+        await message.answer("Неизвестная команда. Откройте «Мои диалоги», чтобы выбрать переписку.", reply_markup=menu_kb)
+        return
+    conversation = await get_active_chat(message.from_user.id)
+    if not conversation:
+        return
+    if conversation["status"] != "open":
+        await message.answer("Этот диалог завершён. Найдите его в «Мои диалоги» и нажмите «Продолжить диалог».")
+        return
+    if message.from_user.id == conversation["buyer_id"]:
+        recipient_id = conversation["seller_id"]
+        sender_label = "Покупатель"
+    elif message.from_user.id == conversation["seller_id"]:
+        recipient_id = conversation["buyer_id"]
+        sender_label = "Продавец"
+    else:
+        await message.answer("Нет доступа к этому диалогу.")
+        return
+    try:
+        await safe_send(bot, recipient_id, f"💬 <b>{sender_label} по объявлению #{conversation['ad_id']}</b>")
+        await bot.copy_message(
+            chat_id=recipient_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except TelegramAPIError:
+        await message.answer("Не удалось доставить сообщение. Возможно, собеседник ещё не запускал бота или заблокировал его.")
+        return
+    content = message.text or message.caption or f"[{message.content_type}]"
+    await save_chat_message(conversation["id"], message.from_user.id, message.content_type, content)
+    await message.answer("✓ Доставлено", disable_notification=True)
 
 
 # ──────────────────────────── Заполнение анкеты ────────────────────────────
