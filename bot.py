@@ -264,6 +264,20 @@ async def init_db() -> None:
                 user_id INTEGER, event TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS contact_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ad_id INTEGER NOT NULL,
+                buyer_id INTEGER NOT NULL,
+                seller_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS active_chats (
+                user_id INTEGER PRIMARY KEY,
+                peer_id INTEGER NOT NULL,
+                ad_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX IF NOT EXISTS idx_ads_status_created ON ads(status, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_ads_user_created ON ads(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_events_ad ON ad_events(ad_id, event);
@@ -353,6 +367,81 @@ async def create_safety_report(ad_id: int, reporter_id: int, reason: str) -> int
             return cur.lastrowid
         except aiosqlite.IntegrityError:
             return None
+
+
+async def create_contact_request(ad_id: int, buyer_id: int, seller_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO contact_requests(ad_id, buyer_id, seller_id) VALUES(?,?,?)",
+            (ad_id, buyer_id, seller_id),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_contact_request(request_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM contact_requests WHERE id=?", (request_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def set_contact_request_status(request_id: int, status: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE contact_requests SET status=? WHERE id=? AND status='pending'",
+            (status, request_id),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def get_active_chat(user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM active_chats WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def start_active_chat(user_a: int, user_b: int, ad_id: int) -> bool:
+    """Создаёт двусторонний чат, только если оба пользователя свободны."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT user_id FROM active_chats WHERE user_id IN (?,?)", (user_a, user_b)
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                return False
+            await db.execute(
+                "INSERT INTO active_chats(user_id, peer_id, ad_id) VALUES(?,?,?)",
+                (user_a, user_b, ad_id),
+            )
+            await db.execute(
+                "INSERT INTO active_chats(user_id, peer_id, ad_id) VALUES(?,?,?)",
+                (user_b, user_a, ad_id),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            await db.rollback()
+            return False
+
+
+async def end_active_chat(user_id: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT peer_id FROM active_chats WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        peer_id = row["peer_id"]
+        await db.execute("DELETE FROM active_chats WHERE user_id IN (?,?)", (user_id, peer_id))
+        await db.commit()
+        return peer_id
 
 
 async def record_event(ad_id: int, user_id: int | None, event: str) -> None:
@@ -595,24 +684,129 @@ async def report_ad_callback(cb: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("contact:"))
 async def contact_callback(cb: CallbackQuery, bot: Bot) -> None:
-    ad_id = int(cb.data.split(":",1)[1])
+    try:
+        ad_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Некорректное объявление", show_alert=True)
+        return
     ad = await get_ad(ad_id)
     if not ad or ad["status"] != "approved":
-        await cb.answer("Объявление уже недоступно", show_alert=True); return
+        await cb.answer("Объявление уже недоступно", show_alert=True)
+        return
     if cb.from_user.id == ad["user_id"]:
-        await cb.answer("Это ваше объявление", show_alert=True); return
+        await cb.answer("Это ваше объявление", show_alert=True)
+        return
+
+    existing = await get_active_chat(cb.from_user.id)
+    if existing:
+        await cb.answer("Сначала завершите текущий диалог командой /stop", show_alert=True)
+        return
+    seller_chat = await get_active_chat(ad["user_id"])
+    if seller_chat:
+        await cb.answer("Продавец сейчас общается с другим пользователем. Попробуйте позже.", show_alert=True)
+        return
+
     await record_event(ad_id, cb.from_user.id, "contact")
+    request_id = await create_contact_request(ad_id, cb.from_user.id, ad["user_id"])
+    seller_kb = InlineKeyboardBuilder()
+    seller_kb.button(text="💬 Ответить покупателю", callback_data=f"contact_accept:{request_id}")
+    seller_kb.button(text="✖️ Отклонить", callback_data=f"contact_decline:{request_id}")
+    seller_kb.adjust(1)
+
+    safety_buyer = (
+        "🛡 <b>Памятка покупателю</b>\n\n"
+        "• Не переводите предоплату незнакомому продавцу.\n"
+        "• Встречайтесь в людном общественном месте.\n"
+        "• Проверьте устройство лично: камеры, экран, связь, зарядку, аккаунты и блокировки.\n"
+        "• Сверьте IMEI/серийный номер с настройками и коробкой.\n"
+        "• Не сообщайте коды из SMS, пароли и данные банковской карты.\n\n"
+        "📨 Запрос отправлен продавцу. Когда он нажмёт «Ответить покупателю», вы сможете переписываться прямо здесь, через бота."
+    )
+    safety_seller = (
+        f"💬 <b>Новый запрос по объявлению #{ad_id}</b>\n"
+        f"<b>{e(ad['title'])}</b>\n\n"
+        f"Покупатель: {e(cb.from_user.full_name)}"
+        + (f" (@{e(cb.from_user.username)})" if cb.from_user.username else "")
+        + f"\nID: <code>{cb.from_user.id}</code>\n\n"
+        "🛡 Не переходите по подозрительным ссылкам, не сообщайте SMS-коды и проверяйте оплату только в банковском приложении.\n\n"
+        "Нажмите «Ответить покупателю», чтобы начать переписку."
+    )
     try:
-        await bot.send_message(cb.from_user.id, "🛡 <b>Памятка покупателю</b>\n\n• Не переводите предоплату незнакомому продавцу.\n• Встречайтесь в людном общественном месте.\n• Проверьте устройство лично: камеры, экран, связь, зарядку, аккаунты и блокировки.\n• Сверьте IMEI/серийный номер с настройками и коробкой.\n• Не сообщайте коды из SMS, пароли и данные банковской карты.\n• Если продавец торопит, уводит в сторонние мессенджеры или просит странную оплату — остановитесь и пожалуйтесь через кнопку 🚨.")
-        await bot.send_message(ad["user_id"], f"💬 Покупатель заинтересовался объявлением <b>#{ad_id} {e(ad['title'])}</b>.\n\n🛡 <b>Памятка продавцу</b>\n• Не переходите по подозрительным ссылкам «для получения оплаты».\n• Не сообщайте SMS-коды, пароли и данные карты.\n• Проверяйте поступление денег только в своём банковском приложении — скриншот не является подтверждением.\n• Передавайте товар после фактического получения оплаты или личной проверки при обмене.\n• Не соглашайтесь на сомнительные схемы с курьерами и «безопасной сделкой» вне официальных сервисов.")
-        await cb.answer("Продавец уведомлён. Перед сделкой ознакомьтесь с памяткой безопасности.", show_alert=True)
+        await bot.send_message(cb.from_user.id, safety_buyer)
+        await bot.send_message(ad["user_id"], safety_seller, reply_markup=seller_kb.as_markup())
     except TelegramAPIError:
-        await cb.answer("Продавец ещё не запускал бота. Попробуйте позже.", show_alert=True)
+        await set_contact_request_status(request_id, "failed")
+        await cb.answer("Не удалось доставить запрос. Возможно, продавец заблокировал бота.", show_alert=True)
+        return
+    await cb.answer("Запрос отправлен продавцу. Ожидайте ответа в этом чате.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("contact_accept:"))
+async def contact_accept_callback(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        request_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Некорректный запрос", show_alert=True)
+        return
+    request = await get_contact_request(request_id)
+    if not request or request["seller_id"] != cb.from_user.id or request["status"] != "pending":
+        await cb.answer("Запрос уже недоступен", show_alert=True)
+        return
+    ad = await get_ad(request["ad_id"])
+    if not ad or ad["status"] != "approved":
+        await set_contact_request_status(request_id, "closed")
+        await cb.answer("Объявление уже недоступно", show_alert=True)
+        return
+    if not await start_active_chat(request["seller_id"], request["buyer_id"], request["ad_id"]):
+        await cb.answer("У вас или покупателя уже есть активный диалог. Завершите его командой /stop.", show_alert=True)
+        return
+    await set_contact_request_status(request_id, "accepted")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await safe_send(bot, request["buyer_id"],
+        f"✅ Продавец ответил по объявлению «{e(ad['title'])}».\n\n"
+        "Теперь отправьте сообщение, фото или видео — продавец получит его через Trade Bish.\n"
+        "Для завершения переписки отправьте /stop.")
+    await cb.message.answer(
+        f"✅ Диалог с покупателем по объявлению #{request['ad_id']} открыт.\n"
+        "Отправляйте сообщения, фото или видео — бот передаст их покупателю.\n"
+        "Для завершения переписки отправьте /stop.")
+    await cb.answer("Диалог открыт")
+
+
+@router.callback_query(F.data.startswith("contact_decline:"))
+async def contact_decline_callback(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        request_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Некорректный запрос", show_alert=True)
+        return
+    request = await get_contact_request(request_id)
+    if not request or request["seller_id"] != cb.from_user.id or request["status"] != "pending":
+        await cb.answer("Запрос уже недоступен", show_alert=True)
+        return
+    await set_contact_request_status(request_id, "declined")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await safe_send(bot, request["buyer_id"], "Продавец пока не готов общаться по этому объявлению.")
+    await cb.answer("Запрос отклонён")
+
+
+@router.message(Command("stop"))
+async def stop_chat(message: Message, bot: Bot) -> None:
+    peer_id = await end_active_chat(message.from_user.id)
+    if peer_id is None:
+        await message.answer("У вас нет активного диалога.")
+        return
+    await message.answer("Диалог завершён.")
+    await safe_send(bot, peer_id, "Собеседник завершил диалог. Чтобы начать новый, откройте объявление и нажмите «Написать продавцу».")
 
 
 @router.message(Command("reply"))
 async def reply_help(message: Message) -> None:
-    await message.answer("💬 Сейчас бот уведомляет продавца о запросе контакта. Для безопасности не отправляйте в переписке коды, пароли и данные банковских карт.")
+    chat = await get_active_chat(message.from_user.id)
+    if chat:
+        await message.answer("💬 Диалог активен. Просто отправьте сообщение, фото или видео. Для завершения — /stop.")
+    else:
+        await message.answer("Чтобы связаться с продавцом, откройте объявление и нажмите «💬 Написать продавцу». Когда продавец примет запрос, переписка начнётся здесь.")
 
 
 @router.message(Command("safety"))
@@ -940,6 +1134,24 @@ async def mod_reject_finish(message: Message, state: FSMContext, bot: Bot) -> No
     except TelegramAPIError:
         pass
     await message.answer(f"Заявка #{ad_id} отклонена, продавец уведомлён.")
+
+
+@router.message(StateFilter(None), F.chat.type == "private")
+async def relay_chat_message(message: Message, bot: Bot) -> None:
+    """Пересылает сообщения между покупателем и продавцом в активном диалоге."""
+    if message.text and message.text.startswith("/"):
+        return
+    chat = await get_active_chat(message.from_user.id)
+    if not chat:
+        return
+    try:
+        await bot.copy_message(
+            chat_id=chat["peer_id"],
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except TelegramAPIError:
+        await message.answer("Не удалось доставить сообщение собеседнику. Попробуйте ещё раз или завершите диалог командой /stop.")
 
 
 # ──────────────────────────── Запуск ────────────────────────────
